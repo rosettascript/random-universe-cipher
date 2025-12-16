@@ -15,6 +15,7 @@ import {
   encryptWithPasswordAEAD,
   decryptWithPasswordAEAD,
 } from '../cipher';
+import { isVideoFile, isLargeFile } from './file-streaming';
 
 // DOM Elements
 let passwordInput: HTMLInputElement;
@@ -53,6 +54,11 @@ let processedFileName: string = '';
 // Web Worker for background processing
 let cryptoWorker: Worker | null = null;
 let pendingOperation: { resolve: (data: Uint8Array) => void; reject: (error: Error) => void } | null = null;
+
+// Progress tracking
+let progressStartTime: number | null = null;
+let lastProgressUpdate: number = 0;
+let lastProgressPercent: number = 0;
 
 /**
  * Initialize the demo UI
@@ -461,7 +467,13 @@ function selectFile(file: File): void {
   
   // Update UI
   fileName.textContent = file.name;
-  fileSize.textContent = formatFileSize(file.size);
+  const sizeText = formatFileSize(file.size);
+  fileSize.textContent = sizeText + (isVideoFile(file.name) ? ' 🎥' : isLargeFile(file) ? ' 📦' : '');
+  
+  // Show warning for very large files
+  if (file.size > 500 * 1024 * 1024) { // > 500MB
+    console.log(`Large file detected (${sizeText}). Processing may take a while...`);
+  }
   
   dropZone.style.display = 'none';
   fileInfo.style.display = 'flex';
@@ -506,12 +518,83 @@ function formatFileSize(bytes: number): string {
 }
 
 /**
- * Show progress
+ * Format time duration nicely
+ */
+function formatTime(seconds: number): string {
+  if (seconds < 60) {
+    return `${Math.round(seconds)}s`;
+  } else if (seconds < 3600) {
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.round(seconds % 60);
+    return `${mins}m ${secs}s`;
+  } else {
+    const hours = Math.floor(seconds / 3600);
+    const mins = Math.floor((seconds % 3600) / 60);
+    return `${hours}h ${mins}m`;
+  }
+}
+
+/**
+ * Show progress with time estimation
  */
 function showProgress(text: string, percent: number): void {
   fileProgress.style.display = 'block';
-  progressText.textContent = text;
   progressFill.style.width = `${percent}%`;
+  
+  // Initialize start time on first progress update
+  if (progressStartTime === null) {
+    progressStartTime = performance.now();
+    lastProgressUpdate = progressStartTime;
+    lastProgressPercent = 0;
+  }
+  
+  const now = performance.now();
+  const elapsedSeconds = (now - progressStartTime) / 1000;
+  
+  // Calculate estimated time remaining
+  let timeRemainingText = '';
+  if (percent > 0 && percent < 100) {
+    // Only estimate if we have meaningful progress
+    const progressDelta = percent - lastProgressPercent;
+    const timeDelta = (now - lastProgressUpdate) / 1000;
+    
+    if (progressDelta > 0 && timeDelta > 0) {
+      // Calculate speed: percent per second
+      const speed = progressDelta / timeDelta;
+      const remainingPercent = 100 - percent;
+      const estimatedSeconds = remainingPercent / speed;
+      
+      if (estimatedSeconds > 0 && estimatedSeconds < 3600) { // Don't show if > 1 hour
+        timeRemainingText = ` • ~${formatTime(estimatedSeconds)} remaining`;
+      }
+    }
+  }
+  
+  // Update display with percentage and time info
+  // Format: "Status • XX.X% (time elapsed) • ~time remaining"
+  let displayText = `${text} • ${percent.toFixed(1)}%`;
+  
+  if (elapsedSeconds > 1) {
+    displayText += ` (${formatTime(elapsedSeconds)} elapsed)`;
+  }
+  
+  if (timeRemainingText) {
+    displayText += timeRemainingText;
+  }
+  
+  progressText.textContent = displayText;
+  
+  lastProgressUpdate = now;
+  lastProgressPercent = percent;
+}
+
+/**
+ * Reset progress tracking
+ */
+function resetProgressTracking(): void {
+  progressStartTime = null;
+  lastProgressUpdate = 0;
+  lastProgressPercent = 0;
 }
 
 /**
@@ -519,6 +602,7 @@ function showProgress(text: string, percent: number): void {
  */
 function hideProgress(): void {
   fileProgress.style.display = 'none';
+  resetProgressTracking();
 }
 
 /**
@@ -549,11 +633,21 @@ function initCryptoWorker(): void {
       const { type, data, error, progress, message } = event.data;
       
       if (type === 'progress') {
-        showProgress(message || 'Processing...', progress || 0);
+        const progressPercent = progress || 0;
+        const progressMessage = message || 'Processing...';
+        showProgress(progressMessage, progressPercent);
       } else if (type === 'success' && pendingOperation) {
+        // Show 100% before resolving
+        if (progressStartTime !== null) {
+          showProgress('Complete!', 100);
+          setTimeout(() => {
+            hideProgress();
+          }, 500);
+        }
         pendingOperation.resolve(data);
         pendingOperation = null;
       } else if (type === 'error' && pendingOperation) {
+        hideProgress();
         pendingOperation.reject(new Error(error || 'Unknown error'));
         pendingOperation = null;
       }
@@ -582,6 +676,10 @@ async function processWithWorker(
   data: Uint8Array,
   password: string
 ): Promise<Uint8Array> {
+  // Use fast processing for files larger than 1KB
+  // Always use fast for large files (videos, etc.)
+  const useFast = data.length > 1024;
+  
   if (cryptoWorker) {
     return new Promise((resolve, reject) => {
       pendingOperation = { resolve, reject };
@@ -590,18 +688,30 @@ async function processWithWorker(
         id: Date.now().toString(),
         data,
         password,
+        useFast, // Enable fast chunked processing for large files
       });
     });
   } else {
-    // Fallback: run on main thread with yielding
+    // Fallback: run on main thread with fast processing if available
     showProgress('Processing (main thread)...', 30);
     await yieldToMain();
     
+    // Import fast functions for main thread fallback
+    const { encryptWithPasswordAEADFast, decryptWithPasswordAEADFast } = await import('../cipher');
+    
     if (type === 'encrypt') {
-      const result = await encryptWithPasswordAEAD(data, password, undefined, 'interactive');
+      const result = useFast
+        ? await encryptWithPasswordAEADFast(data, password, undefined, 'interactive', (progress) => {
+            showProgress(`Encrypting... ${progress}%`, progress);
+          })
+        : await encryptWithPasswordAEAD(data, password, undefined, 'interactive');
       return result;
     } else {
-      const result = await decryptWithPasswordAEAD(data, password, undefined, 'interactive');
+      const result = useFast
+        ? await decryptWithPasswordAEADFast(data, password, undefined, 'interactive', (progress) => {
+            showProgress(`Decrypting... ${progress}%`, progress);
+          })
+        : await decryptWithPasswordAEAD(data, password, undefined, 'interactive');
       return result;
     }
   }
@@ -631,12 +741,27 @@ async function handleEncryptFile(): Promise<void> {
   decryptFileBtn.disabled = true;
 
   try {
-    showProgress('Reading file...', 10);
+    // For very large files, show a more detailed progress message
+    const isLarge = isLargeFile(currentFile);
+    const isVideo = isVideoFile(currentFile.name);
+    
+    if (isVideo || isLarge) {
+      showProgress(`Reading ${isVideo ? 'video' : 'large'} file (${formatFileSize(currentFile.size)})...`, 5);
+    } else {
+      showProgress('Reading file...', 10);
+    }
     await yieldToMain();
     
     // Read file as ArrayBuffer
+    // Note: For extremely large files (>2GB), browser may have limitations
+    // In production, you might want to use streaming for files > 1GB
     const arrayBuffer = await currentFile.arrayBuffer();
     const fileData = new Uint8Array(arrayBuffer);
+    
+    if (isVideo || isLarge) {
+      showProgress('File loaded. Starting encryption...', 15);
+      await yieldToMain();
+    }
     
     // Add filename to the beginning so we can recover it
     const filenameBytes = new TextEncoder().encode(currentFile.name);
@@ -653,16 +778,25 @@ async function handleEncryptFile(): Promise<void> {
     // Encrypt with worker
     const encrypted = await processWithWorker('encrypt', dataToEncrypt, password);
     
-    showProgress('Complete!', 100);
-    
-    // Store result
-    processedFileData = encrypted;
-    processedFileName = currentFile.name + '.ruc';
-    
-    setTimeout(() => {
+    // Final progress update with total time
+    if (progressStartTime !== null) {
+      const totalTime = (performance.now() - progressStartTime) / 1000;
+      showProgress('Complete!', 100);
+      
+      // Store result
+      processedFileData = encrypted;
+      processedFileName = currentFile.name + '.ruc';
+      
+      setTimeout(() => {
+        hideProgress();
+        showFileOutput(true, `Encrypted successfully! Size: ${formatFileSize(encrypted.length)} • Time: ${formatTime(totalTime)}`);
+      }, 500);
+    } else {
+      processedFileData = encrypted;
+      processedFileName = currentFile.name + '.ruc';
       hideProgress();
       showFileOutput(true, `Encrypted successfully! Size: ${formatFileSize(encrypted.length)}`);
-    }, 300);
+    }
     
   } catch (error) {
     hideProgress();
@@ -691,12 +825,28 @@ async function handleDecryptFile(): Promise<void> {
   decryptFileBtn.disabled = true;
 
   try {
-    showProgress('Reading file...', 10);
+    // Reset progress tracking for new operation
+    resetProgressTracking();
+    
+    // For very large files, show a more detailed progress message
+    const isLarge = isLargeFile(currentFile);
+    const isVideo = isVideoFile(currentFile.name);
+    
+    if (isVideo || isLarge) {
+      showProgress(`Reading ${isVideo ? 'video' : 'large'} file (${formatFileSize(currentFile.size)})...`, 5);
+    } else {
+      showProgress('Reading file...', 10);
+    }
     await yieldToMain();
     
     // Read file as ArrayBuffer
     const arrayBuffer = await currentFile.arrayBuffer();
     const encryptedData = new Uint8Array(arrayBuffer);
+    
+    if (isVideo || isLarge) {
+      showProgress('File loaded. Starting decryption...', 15);
+      await yieldToMain();
+    }
     
     // Decrypt with worker
     let decrypted: Uint8Array;
@@ -719,16 +869,25 @@ async function handleDecryptFile(): Promise<void> {
     const originalFilename = new TextDecoder().decode(filenameBytes);
     const fileData = decrypted.subarray(2 + filenameLength);
     
-    showProgress('Complete!', 100);
-    
-    // Store result
-    processedFileData = fileData;
-    processedFileName = originalFilename;
-    
-    setTimeout(() => {
+    // Final progress update with total time
+    if (progressStartTime !== null) {
+      const totalTime = (performance.now() - progressStartTime) / 1000;
+      showProgress('Complete!', 100);
+      
+      // Store result
+      processedFileData = fileData;
+      processedFileName = originalFilename;
+      
+      setTimeout(() => {
+        hideProgress();
+        showFileOutput(true, `Decrypted successfully! Original: ${originalFilename} (${formatFileSize(fileData.length)}) • Time: ${formatTime(totalTime)}`);
+      }, 500);
+    } else {
+      processedFileData = fileData;
+      processedFileName = originalFilename;
       hideProgress();
       showFileOutput(true, `Decrypted successfully! Original: ${originalFilename} (${formatFileSize(fileData.length)})`);
-    }, 300);
+    }
     
   } catch (error) {
     hideProgress();

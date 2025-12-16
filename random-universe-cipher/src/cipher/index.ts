@@ -42,6 +42,8 @@ export {
 export { encryptBlock, createCipherState, cloneCipherState } from './encrypt';
 export { decryptBlock } from './decrypt';
 export { encryptCTR, decryptCTR, encryptCBC, decryptCBC, encrypt, decrypt } from './modes';
+export { encryptCTRFast, decryptCTRFast, encryptFast, decryptFast } from './modes-fast';
+export { initWASM, isWASMAvailable, encryptBlockWASM, decryptBlockWASM } from './wasm-accelerated';
 
 // Re-export AEAD (authenticated encryption)
 export { aeadEncrypt, aeadDecrypt, aeadEncryptString, aeadDecryptString } from './aead';
@@ -74,9 +76,11 @@ import type { EncryptionResult, DecryptionResult } from './types';
 import { BYTES } from './constants';
 import { deriveKeyFromPassword, generateRandomKey as genKey } from './key-expansion';
 import { encryptCTR, decryptCTR } from './modes';
+import { encryptCTRFast, decryptCTRFast } from './modes-fast';
 import { aeadEncrypt, aeadDecrypt } from './aead';
 import { deriveKeyArgon2, generateSalt, type KDFLevel } from './kdf';
-import { stringToBytes, bytesToString, randomBytes } from './bigint-utils';
+import { stringToBytes, bytesToString, randomBytes, concatBytes, constantTimeEqual } from './bigint-utils';
+import { shake256Hash } from './shake256';
 
 /**
  * High-level cipher class for easy encryption/decryption
@@ -494,5 +498,179 @@ export async function secureDecrypt(
 ): Promise<string> {
   const encrypted = base64ToBytes(ciphertext);
   return decryptWithPasswordAEADToString(encrypted, password, undefined, level);
+}
+
+// ============================================================
+// FAST PASSWORD-BASED ENCRYPTION (for large files)
+// ============================================================
+// These functions use optimized chunked parallel processing
+// for faster encryption/decryption of large files
+// ============================================================
+
+/**
+ * FAST: Encrypt with password using AEAD (optimized for large files)
+ * 
+ * Uses chunked parallel processing for better performance on large files.
+ * Output format: salt (16) || nonce (16) || ciphertext || tag (32)
+ * 
+ * @param plaintext - Data to encrypt
+ * @param password - Password for key derivation
+ * @param associatedData - Optional data to authenticate but not encrypt
+ * @param level - Argon2 security level
+ * @param onProgress - Optional progress callback (0-100)
+ */
+export async function encryptWithPasswordAEADFast(
+  plaintext: string | Uint8Array,
+  password: string,
+  associatedData: Uint8Array | string | undefined,
+  level: KDFLevel,
+  onProgress?: (progress: number) => void
+): Promise<Uint8Array> {
+  const data = typeof plaintext === 'string' ? stringToBytes(plaintext) : plaintext;
+  
+  // Derive key
+  if (onProgress) onProgress(5);
+  const salt = generateSalt();
+  const { key } = await deriveKeyArgon2(password, salt, level);
+  
+  if (onProgress) onProgress(15);
+  
+  // Use fast CTR encryption
+  const ctrEncrypted = await encryptCTRFast(
+    data,
+    key,
+    undefined,
+    (progress) => {
+      // Map CTR progress (0-100) to overall progress (15-75)
+      if (onProgress) onProgress(15 + Math.floor(progress * 0.6));
+    }
+  );
+  
+  // Extract nonce and ciphertext from CTR output
+  const ctrCiphertext = ctrEncrypted.subarray(BYTES.NONCE);
+  
+  // Compute authentication tag
+  if (onProgress) onProgress(80);
+  const adBytes = associatedData
+    ? (typeof associatedData === 'string' ? stringToBytes(associatedData) : associatedData)
+    : undefined;
+  
+  // Derive MAC key
+  const macKey = shake256Hash(
+    concatBytes(key, stringToBytes('RUC-AEAD-MAC')),
+    32
+  );
+  
+  // Compute tag over nonce || ciphertext || AD
+  const adLen = adBytes?.length ?? 0;
+  const adLenBytes = new Uint8Array(8);
+  const adLenView = new DataView(adLenBytes.buffer);
+  adLenView.setBigUint64(0, BigInt(adLen), false);
+  
+  const dataToAuth = adBytes
+    ? concatBytes(adLenBytes, adBytes, ctrEncrypted)
+    : concatBytes(adLenBytes, ctrEncrypted);
+  
+  const { hmac } = await import('@noble/hashes/hmac');
+  const { sha256 } = await import('@noble/hashes/sha256');
+  const tag = hmac(sha256, macKey, dataToAuth);
+  
+  if (onProgress) onProgress(95);
+  
+  // Bundle: salt || nonce || ciphertext || tag
+  const result = new Uint8Array(SALT_SIZE + BYTES.NONCE + ctrCiphertext.length + tag.length);
+  result.set(salt, 0);
+  result.set(ctrEncrypted, SALT_SIZE);
+  result.set(tag, SALT_SIZE + ctrEncrypted.length);
+  
+  if (onProgress) onProgress(100);
+  
+  return result;
+}
+
+/**
+ * FAST: Decrypt with password using AEAD (optimized for large files)
+ * 
+ * Uses chunked parallel processing for better performance on large files.
+ * 
+ * @throws Error if authentication fails (data tampered or wrong password)
+ */
+export async function decryptWithPasswordAEADFast(
+  ciphertext: Uint8Array,
+  password: string,
+  associatedData: Uint8Array | string | undefined,
+  level: KDFLevel,
+  onProgress?: (progress: number) => void
+): Promise<Uint8Array> {
+  const TAG_SIZE = 32;
+  const minSize = SALT_SIZE + BYTES.NONCE + BYTES.BLOCK + TAG_SIZE;
+  
+  if (ciphertext.length < minSize) {
+    throw new Error('Ciphertext too short');
+  }
+  
+  // Extract components
+  const salt = ciphertext.subarray(0, SALT_SIZE);
+  const nonce = ciphertext.subarray(SALT_SIZE, SALT_SIZE + BYTES.NONCE);
+  const tagStart = ciphertext.length - TAG_SIZE;
+  const ctrCiphertext = ciphertext.subarray(SALT_SIZE + BYTES.NONCE, tagStart);
+  const providedTag = ciphertext.subarray(tagStart);
+  
+  // Derive key
+  if (onProgress) onProgress(5);
+  const { key } = await deriveKeyArgon2(password, salt, level);
+  
+  if (onProgress) onProgress(15);
+  
+  // Verify authentication tag
+  const adBytes = associatedData
+    ? (typeof associatedData === 'string' ? stringToBytes(associatedData) : associatedData)
+    : undefined;
+  
+  // Derive MAC key
+  const macKey = shake256Hash(
+    concatBytes(key, stringToBytes('RUC-AEAD-MAC')),
+    32
+  );
+  
+  // Reconstruct CTR encrypted data (nonce || ciphertext)
+  const ctrEncrypted = new Uint8Array(BYTES.NONCE + ctrCiphertext.length);
+  ctrEncrypted.set(nonce, 0);
+  ctrEncrypted.set(ctrCiphertext, BYTES.NONCE);
+  
+  // Compute expected tag
+  const adLen = adBytes?.length ?? 0;
+  const adLenBytes = new Uint8Array(8);
+  const adLenView = new DataView(adLenBytes.buffer);
+  adLenView.setBigUint64(0, BigInt(adLen), false);
+  
+  const dataToAuth = adBytes
+    ? concatBytes(adLenBytes, adBytes, ctrEncrypted)
+    : concatBytes(adLenBytes, ctrEncrypted);
+  
+  const { hmac } = await import('@noble/hashes/hmac');
+  const { sha256 } = await import('@noble/hashes/sha256');
+  const expectedTag = hmac(sha256, macKey, dataToAuth);
+  
+  // Constant-time comparison
+  if (!constantTimeEqual(providedTag, expectedTag)) {
+    throw new Error('Authentication failed: invalid tag');
+  }
+  
+  if (onProgress) onProgress(20);
+  
+  // Decrypt with fast CTR
+  const decrypted = await decryptCTRFast(
+    ctrEncrypted,
+    key,
+    (progress) => {
+      // Map CTR progress (0-100) to overall progress (20-95)
+      if (onProgress) onProgress(20 + Math.floor(progress * 0.75));
+    }
+  );
+  
+  if (onProgress) onProgress(100);
+  
+  return decrypted;
 }
 
